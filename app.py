@@ -283,11 +283,11 @@ def update():
 # UPDATE RESULTS (FOOTBALL)
 # -----------------------------
 @app.get("/update-results")
-def update_results():
+def update_results(force: bool = False):
     if not API_FOOTBALL_KEY:
         raise HTTPException(status_code=500, detail="Missing API_FOOTBALL_KEY")
 
-    if already_updated_today("last_results_update"):
+    if not force and already_updated_today("last_results_update"):
         return {"status": "skipped", "reason": "results already updated today"}
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -318,15 +318,19 @@ def update_results():
 
             home = teams.get("home", {}).get("name", "")
             away = teams.get("away", {}).get("name", "")
-            match = f"{home} vs {away}"
 
             event = conn.execute("""
                 SELECT event_id
                 FROM history
-                WHERE league = ? AND match = ?
+                WHERE league = ?
+                  AND (match LIKE ? OR match LIKE ?)
                 ORDER BY created_at DESC
                 LIMIT 1
-            """, (cfg["league"], match)).fetchone()
+            """, (
+                cfg["league"],
+                f"%{home}%",
+                f"%{away}%"
+            )).fetchone()
 
             if not event:
                 continue
@@ -359,10 +363,18 @@ def update_results():
 
     conn.commit()
 
+    if inserted > 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            ("last_results_update", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        )
+        conn.commit()
+
     return {
         "status": "updated-results",
         "rows_inserted": inserted,
-        "leagues_checked": len(FOOTBALL_RESULT_LEAGUES)
+        "leagues_checked": len(FOOTBALL_RESULT_LEAGUES),
+        "forced": force
     }
 
 # -----------------------------
