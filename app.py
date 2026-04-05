@@ -235,7 +235,10 @@ def update_results(force: bool = False):
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     season = current_football_season()
     today = date.today()
-    days_to_check = [today.isoformat(), (today - timedelta(days=1)).isoformat()]
+    days_to_check = [
+    (today - timedelta(days=i)).isoformat()
+    for i in range(0, 7)
+]
 
     inserted = 0
     debug_rows = []
