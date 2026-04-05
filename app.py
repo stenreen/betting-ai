@@ -357,16 +357,30 @@ def picks():
         SELECT event_id, match, league, selection, odds, edge, score
         FROM picks
         ORDER BY score DESC, edge DESC
-        LIMIT 20
+        LIMIT 10
     """, conn)
 
     if df.empty:
         return []
 
     df["decision"] = df.apply(lambda r: decision_from_score(r["score"], r["edge"]), axis=1)
-    df = df[df["decision"] != "❌ PASS"]
+    df = df[df["decision"] != "❌ PASS"].copy()
 
-    return df.to_dict(orient="records")
+    if df.empty:
+        return []
+
+    df["bet"] = df["selection"] + " att vinna"
+    df["edge_pct"] = (df["edge"] * 100).round(1)
+
+    return df[[
+        "match",
+        "league",
+        "bet",
+        "odds",
+        "edge_pct",
+        "score",
+        "decision"
+    ]].to_dict(orient="records")
 
 # -----------------------------
 # HISTORY
