@@ -1,3 +1,5 @@
 fastapi
 uvicorn
-pandas  
+pandas
+requests
+python-dotenv
