@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 import pandas as pd
 import sqlite3
 import requests
 import os
+import unicodedata
 from datetime import date, datetime, timezone, timedelta
 
-app = FastAPI(title="Betting AI Fetch/Generate Model")
+app = FastAPI(title="Betting AI")
 
 conn = sqlite3.connect("data.db", check_same_thread=False)
 conn.row_factory = sqlite3.Row
@@ -78,6 +80,7 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 # -----------------------------
 # CONFIG
 # -----------------------------
+# 10 ligor = enklare att hålla inom gratisgränsen även med viss testning
 LEAGUES = [
     ("soccer_sweden_allsvenskan", "Allsvenskan"),
     ("soccer_sweden_superettan", "Superettan"),
@@ -97,21 +100,27 @@ RESULT_LEAGUES = [
     {"league_id": 119, "league": "Superliga"},
     {"league_id": 103, "league": "Eliteserien"},
     {"league_id": 244, "league": "Veikkausliiga"},
-    {"league_id": 40, "league": "Championship"},
+    {"league_id": 40,  "league": "Championship"},
     {"league_id": 140, "league": "La Liga"},
     {"league_id": 135, "league": "Serie A"},
-    {"league_id": 61, "league": "Ligue 1"},
+    {"league_id": 61,  "league": "Ligue 1"},
     {"league_id": 253, "league": "MLS"},
 ]
+
+FINAL_STATUSES = {"FT", "AET", "PEN"}
 
 # -----------------------------
 # HELPERS
 # -----------------------------
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def today_utc():
+def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def current_football_season() -> int:
+    today = date.today()
+    return today.year if today.month >= 7 else today.year - 1
 
 def was_updated_today(key: str) -> bool:
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -124,21 +133,29 @@ def mark_updated_today(key: str):
     )
     conn.commit()
 
-def norm(s: str):
-    return (
-        str(s or "")
-        .lower()
-        .replace(" if", "")
-        .replace(" fc", "")
-        .replace(" bk", "")
-        .replace(".", "")
-        .replace("-", " ")
-        .replace("  ", " ")
-        .strip()
+def strip_accents(text: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", str(text))
+        if not unicodedata.combining(ch)
     )
 
-def score_pick(odds: float, league: str):
-    implied = 1 / odds
+def norm(s: str) -> str:
+    s = strip_accents(str(s or "").lower())
+    replacements = [
+        (" if", ""),
+        (" fc", ""),
+        (" bk", ""),
+        (" ff", ""),
+        (".", ""),
+        ("-", " "),
+        ("  ", " "),
+    ]
+    for old, new in replacements:
+        s = s.replace(old, new)
+    return s.strip()
+
+def score_pick(odds: float, league: str) -> tuple[float, float]:
+    implied = 1.0 / odds
 
     league_bonus = {
         "Allsvenskan": 0.020,
@@ -161,24 +178,159 @@ def score_pick(odds: float, league: str):
 
     model_prob = min(max(implied + league_bonus + odds_bonus, 0.01), 0.99)
     edge = model_prob - implied
-    score = edge * 100
+    score = edge * 100.0
 
     return round(edge, 4), round(score, 2)
 
-def decision_from_score(score: float, edge: float):
+def decision_from_score(score: float, edge: float) -> str:
     if score >= 2.5 and edge >= 0.025:
         return "🔥 SPELA"
-    elif score >= 1.5 and edge >= 0.015:
+    if score >= 1.5 and edge >= 0.015:
         return "⚠️ BEVAKA"
     return "❌ PASS"
 
 # -----------------------------
-# ROOT
+# UI STARTSIDA
 # -----------------------------
-@app.get("/")
-def root():
-    return {"status": "running"}
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>Betting AI</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: #f5f7fb;
+                margin: 0;
+                padding: 36px;
+            }
+            .wrap {
+                max-width: 1100px;
+                margin: auto;
+            }
+            h1 {
+                margin: 0 0 10px 0;
+                color: #24364b;
+            }
+            .sub {
+                color: #5b6776;
+                margin-bottom: 24px;
+            }
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                gap: 16px;
+            }
+            .card {
+                background: white;
+                border-radius: 14px;
+                padding: 20px;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+            }
+            .card h3 {
+                margin-top: 0;
+                color: #24364b;
+            }
+            .card p {
+                color: #4f5f73;
+                min-height: 44px;
+            }
+            .btn {
+                display: inline-block;
+                padding: 10px 14px;
+                border-radius: 10px;
+                color: white;
+                text-decoration: none;
+                font-weight: bold;
+                background: #1f6feb;
+            }
+            .btn.green { background: #1f8f6a; }
+            .btn.orange { background: #d97706; }
+            .btn.gray { background: #64748b; }
+            .note {
+                margin-top: 24px;
+                background: #fff7d6;
+                border-radius: 12px;
+                padding: 14px 16px;
+                color: #5c4a00;
+            }
+            code {
+                background: #eef2f7;
+                padding: 2px 6px;
+                border-radius: 6px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <h1>Betting AI Dashboard</h1>
+            <div class="sub">Odds hämtas via schema. Picks genereras från sparad data.</div>
 
+            <div class="grid">
+                <div class="card">
+                    <h3>1. Hämta odds</h3>
+                    <p>Låst för manuell användning. Körs via schema eller med force.</p>
+                    <a class="btn gray" href="/fetch-odds">Visa status</a>
+                </div>
+
+                <div class="card">
+                    <h3>2. Generera picks</h3>
+                    <p>Bygger spelförslag från senaste sparade odds.</p>
+                    <a class="btn green" href="/generate-picks">Kör generate-picks</a>
+                </div>
+
+                <div class="card">
+                    <h3>3. Se picks</h3>
+                    <p>Visar aktuella spelförslag från databasen.</p>
+                    <a class="btn" href="/picks">Öppna picks</a>
+                </div>
+
+                <div class="card">
+                    <h3>4. Hämta resultat</h3>
+                    <p>Hämtar resultat och försöker matcha mot historiken.</p>
+                    <a class="btn orange" href="/fetch-results?force=true">Kör fetch-results</a>
+                </div>
+
+                <div class="card">
+                    <h3>Historik</h3>
+                    <p>Visar sparade picks och eventuella resultat.</p>
+                    <a class="btn" href="/history">Öppna history</a>
+                </div>
+
+                <div class="card">
+                    <h3>Statistik</h3>
+                    <p>Visar plays, wins, losses, profit och ROI.</p>
+                    <a class="btn" href="/stats">Öppna stats</a>
+                </div>
+
+                <div class="card">
+                    <h3>Hälsa</h3>
+                    <p>Visar hur många rader som finns i databasen.</p>
+                    <a class="btn" href="/health">Öppna health</a>
+                </div>
+
+                <div class="card">
+                    <h3>API Docs</h3>
+                    <p>FastAPI:s inbyggda docs för felsökning och test.</p>
+                    <a class="btn" href="/docs">Öppna docs</a>
+                </div>
+            </div>
+
+            <div class="note">
+                Rekommenderat schema:
+                <br><code>/fetch-odds?force=true</code> kl 05:00
+                <br><code>/generate-picks</code> kl 05:05
+                <br><code>/fetch-results?force=true</code> kl 23:00
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+# -----------------------------
+# HEALTH
+# -----------------------------
 @app.get("/health")
 def health():
     return {
@@ -197,17 +349,33 @@ def fetch_odds(force: bool = False):
     if not ODDS_API_KEY:
         raise HTTPException(status_code=500, detail="Missing ODDS_API_KEY")
 
-    if not force and was_updated_today("odds_fetch"):
-        return {"status": "skipped", "reason": "odds already fetched today"}
+    # Låst för manuell användning utan force
+    if not force:
+        return {
+            "status": "locked",
+            "reason": "Fetch är låst. Kör via scheduler eller /fetch-odds?force=true"
+        }
+
+    if was_updated_today("odds_fetch"):
+        return {
+            "status": "skipped",
+            "reason": "odds already fetched today"
+        }
 
     inserted = 0
     pulled_at = now_iso()
 
-    # Vi sparar snapshots, men tar bort dagens snapshot först så inte samma dag dubblas vid force
-    conn.execute("DELETE FROM odds_snapshot WHERE substr(pulled_at,1,10) = ?", (today_utc(),))
+    # Rensa bara dagens snapshots så force inte dubblar samma dag
+    conn.execute(
+        "DELETE FROM odds_snapshot WHERE substr(pulled_at,1,10) = ?",
+        (today_utc(),)
+    )
 
     for sport, league in LEAGUES:
-        url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal"
+        url = (
+            f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+            f"?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal"
+        )
 
         try:
             resp = requests.get(url, timeout=30)
@@ -238,8 +406,14 @@ def fetch_odds(force: bool = False):
                     INSERT INTO odds_snapshot
                     (event_id, match, league, selection, odds, pulled_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (event_id, match, league, selection, float(odds), pulled_at))
-
+                """, (
+                    event_id,
+                    match,
+                    league,
+                    selection,
+                    float(odds),
+                    pulled_at
+                ))
                 inserted += 1
 
     conn.commit()
@@ -247,7 +421,10 @@ def fetch_odds(force: bool = False):
     if inserted > 0:
         mark_updated_today("odds_fetch")
 
-    return {"status": "fetched", "rows_inserted": inserted, "force": force}
+    return {
+        "status": "fetched",
+        "rows_inserted": inserted
+    }
 
 # -----------------------------
 # 2) GENERATE PICKS
@@ -256,7 +433,6 @@ def fetch_odds(force: bool = False):
 def generate_picks():
     conn.execute("DELETE FROM picks")
 
-    # Senaste snapshot per event_id + selection
     df = pd.read_sql("""
         SELECT s1.event_id, s1.match, s1.league, s1.selection, s1.odds, s1.pulled_at
         FROM odds_snapshot s1
@@ -265,13 +441,16 @@ def generate_picks():
             FROM odds_snapshot
             GROUP BY event_id, selection
         ) s2
-        ON s1.event_id = s2.event_id
-        AND s1.selection = s2.selection
-        AND s1.pulled_at = s2.max_pulled_at
+          ON s1.event_id = s2.event_id
+         AND s1.selection = s2.selection
+         AND s1.pulled_at = s2.max_pulled_at
     """, conn)
 
     if df.empty:
-        return {"status": "no_data", "reason": "No odds snapshots found. Run /fetch-odds first."}
+        return {
+            "status": "no_data",
+            "reason": "No odds snapshots found. Run /fetch-odds?force=true via scheduler first."
+        }
 
     inserted = 0
     generated_at = now_iso()
@@ -300,13 +479,18 @@ def generate_picks():
             generated_at
         ))
 
+        # Spara bara en gång per event/selection/dag i history
         exists = conn.execute("""
             SELECT 1
             FROM history
             WHERE event_id = ?
               AND selection = ?
               AND substr(generated_at,1,10) = ?
-        """, (row["event_id"], row["selection"], today_stamp)).fetchone()
+        """, (
+            row["event_id"],
+            row["selection"],
+            today_stamp
+        )).fetchone()
 
         if not exists:
             conn.execute("""
@@ -329,7 +513,10 @@ def generate_picks():
 
     conn.commit()
 
-    return {"status": "generated", "rows_inserted": inserted}
+    return {
+        "status": "generated",
+        "rows_inserted": inserted
+    }
 
 # -----------------------------
 # 3) FETCH RESULTS
@@ -340,11 +527,14 @@ def fetch_results(force: bool = False):
         raise HTTPException(status_code=500, detail="Missing API_FOOTBALL_KEY")
 
     if not force and was_updated_today("results_fetch"):
-        return {"status": "skipped", "reason": "results already fetched today"}
+        return {
+            "status": "skipped",
+            "reason": "results already fetched today"
+        }
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     today = date.today()
-    season = today.year if today.month >= 7 else today.year - 1
+    season = current_football_season()
     days = [(today - timedelta(days=i)).isoformat() for i in range(7)]
 
     inserted = 0
@@ -352,7 +542,10 @@ def fetch_results(force: bool = False):
 
     for cfg in RESULT_LEAGUES:
         for d in days:
-            url = f"https://v3.football.api-sports.io/fixtures?league={cfg['league_id']}&season={season}&date={d}"
+            url = (
+                "https://v3.football.api-sports.io/fixtures"
+                f"?league={cfg['league_id']}&season={season}&date={d}"
+            )
 
             try:
                 resp = requests.get(url, headers=headers, timeout=30)
@@ -363,6 +556,10 @@ def fetch_results(force: bool = False):
                 continue
 
             for m in data.get("response", []):
+                status = m.get("fixture", {}).get("status", {}).get("short", "")
+                if status not in FINAL_STATUSES:
+                    continue
+
                 home_raw = m.get("teams", {}).get("home", {}).get("name", "")
                 away_raw = m.get("teams", {}).get("away", {}).get("name", "")
                 home = norm(home_raw)
@@ -394,7 +591,6 @@ def fetch_results(force: bool = False):
 
                 hs = m.get("goals", {}).get("home")
                 aw = m.get("goals", {}).get("away")
-                status = m.get("fixture", {}).get("status", {}).get("short", "")
 
                 winner = "DRAW"
                 if hs is not None and aw is not None:
@@ -407,8 +603,14 @@ def fetch_results(force: bool = False):
                     INSERT OR REPLACE INTO results
                     (event_id, home_score, away_score, winner, status, settled_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (matched_event_id, hs, aw, winner, status, now_iso()))
-
+                """, (
+                    matched_event_id,
+                    hs,
+                    aw,
+                    winner,
+                    status,
+                    now_iso()
+                ))
                 inserted += 1
 
     conn.commit()
@@ -419,7 +621,6 @@ def fetch_results(force: bool = False):
     return {
         "status": "fetched-results",
         "rows_inserted": inserted,
-        "forced": force,
         "debug_sample": debug_rows[:10]
     }
 
@@ -429,7 +630,16 @@ def fetch_results(force: bool = False):
 @app.get("/picks")
 def picks():
     df = pd.read_sql("""
-        SELECT event_id, match, league, selection, odds, edge, score, decision, generated_at
+        SELECT
+            event_id,
+            match,
+            league,
+            selection,
+            odds,
+            edge,
+            score,
+            decision,
+            generated_at
         FROM picks
         ORDER BY score DESC, edge DESC
         LIMIT 20
@@ -458,7 +668,8 @@ def history():
             r.winner,
             r.status
         FROM history h
-        LEFT JOIN results r ON h.event_id = r.event_id
+        LEFT JOIN results r
+          ON h.event_id = r.event_id
         ORDER BY h.generated_at DESC
         LIMIT 300
     """, conn)
@@ -474,11 +685,18 @@ def stats():
             h.odds,
             r.winner
         FROM history h
-        LEFT JOIN results r ON h.event_id = r.event_id
+        LEFT JOIN results r
+          ON h.event_id = r.event_id
     """, conn)
 
     if df.empty:
-        return {"plays": 0, "wins": 0, "losses": 0, "profit_units": 0.0, "roi_percent": 0.0}
+        return {
+            "plays": 0,
+            "wins": 0,
+            "losses": 0,
+            "profit_units": 0.0,
+            "roi_percent": 0.0
+        }
 
     def calc_win(row):
         if pd.isna(row["winner"]):
@@ -487,6 +705,7 @@ def stats():
             home, away = row["match"].split(" vs ")
         except ValueError:
             return None
+
         if row["selection"] == home and row["winner"] == "HOME":
             return 1
         if row["selection"] == away and row["winner"] == "AWAY":
@@ -499,7 +718,13 @@ def stats():
     settled = df[df["win"].notna()].copy()
 
     if settled.empty:
-        return {"plays": 0, "wins": 0, "losses": 0, "profit_units": 0.0, "roi_percent": 0.0}
+        return {
+            "plays": 0,
+            "wins": 0,
+            "losses": 0,
+            "profit_units": 0.0,
+            "roi_percent": 0.0
+        }
 
     settled["profit"] = settled.apply(
         lambda r: (float(r["odds"]) - 1.0) if r["win"] == 1 else -1.0,
