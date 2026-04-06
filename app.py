@@ -5,7 +5,7 @@ import requests
 import os
 from datetime import date, datetime, timezone, timedelta
 
-app = FastAPI(title="Betting AI V2 PRO")
+app = FastAPI(title="Betting AI Fetch/Generate Model")
 
 conn = sqlite3.connect("data.db", check_same_thread=False)
 conn.row_factory = sqlite3.Row
@@ -14,6 +14,17 @@ conn.row_factory = sqlite3.Row
 # DB SETUP
 # -----------------------------
 conn.execute("""
+CREATE TABLE IF NOT EXISTS odds_snapshot (
+    event_id TEXT,
+    match TEXT,
+    league TEXT,
+    selection TEXT,
+    odds REAL,
+    pulled_at TEXT
+)
+""")
+
+conn.execute("""
 CREATE TABLE IF NOT EXISTS picks (
     event_id TEXT,
     match TEXT,
@@ -21,7 +32,9 @@ CREATE TABLE IF NOT EXISTS picks (
     selection TEXT,
     odds REAL,
     edge REAL,
-    score REAL
+    score REAL,
+    decision TEXT,
+    generated_at TEXT
 )
 """)
 
@@ -35,7 +48,7 @@ CREATE TABLE IF NOT EXISTS history (
     edge REAL,
     score REAL,
     decision TEXT,
-    created_at TEXT
+    generated_at TEXT
 )
 """)
 
@@ -61,19 +74,6 @@ conn.commit()
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
-
-# -----------------------------
-# META HELPERS
-# -----------------------------
-def was_updated_today(key: str) -> bool:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return bool(row and row["value"] == today)
-
-def mark_updated_today(key: str):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, today))
-    conn.commit()
 
 # -----------------------------
 # CONFIG
@@ -110,6 +110,33 @@ RESULT_LEAGUES = [
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
+def today_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def was_updated_today(key: str) -> bool:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return bool(row and row["value"] == today_utc())
+
+def mark_updated_today(key: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (key, today_utc())
+    )
+    conn.commit()
+
+def norm(s: str):
+    return (
+        str(s or "")
+        .lower()
+        .replace(" if", "")
+        .replace(" fc", "")
+        .replace(" bk", "")
+        .replace(".", "")
+        .replace("-", " ")
+        .replace("  ", " ")
+        .strip()
+    )
+
 def score_pick(odds: float, league: str):
     implied = 1 / odds
 
@@ -145,19 +172,6 @@ def decision_from_score(score: float, edge: float):
         return "⚠️ BEVAKA"
     return "❌ PASS"
 
-def norm(s: str):
-    return (
-        str(s or "")
-        .lower()
-        .replace(" if", "")
-        .replace(" fc", "")
-        .replace(" bk", "")
-        .replace(".", "")
-        .replace("-", " ")
-        .replace("  ", " ")
-        .strip()
-    )
-
 # -----------------------------
 # ROOT
 # -----------------------------
@@ -167,32 +181,30 @@ def root():
 
 @app.get("/health")
 def health():
-    picks_count = conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
-    history_count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-    results_count = conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
     return {
         "status": "ok",
-        "pick_rows": picks_count,
-        "history_rows": history_count,
-        "result_rows": results_count,
+        "odds_rows": conn.execute("SELECT COUNT(*) FROM odds_snapshot").fetchone()[0],
+        "pick_rows": conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0],
+        "history_rows": conn.execute("SELECT COUNT(*) FROM history").fetchone()[0],
+        "result_rows": conn.execute("SELECT COUNT(*) FROM results").fetchone()[0],
     }
 
 # -----------------------------
-# UPDATE ODDS
+# 1) FETCH ODDS
 # -----------------------------
-@app.get("/update")
-def update(force: bool = False):
+@app.get("/fetch-odds")
+def fetch_odds(force: bool = False):
     if not ODDS_API_KEY:
         raise HTTPException(status_code=500, detail="Missing ODDS_API_KEY")
 
-    existing_picks = conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
+    if not force and was_updated_today("odds_fetch"):
+        return {"status": "skipped", "reason": "odds already fetched today"}
 
-    if not force and was_updated_today("odds") and existing_picks > 0:
-        return {"status": "skipped", "reason": "already updated today and picks exist"}
-
-    conn.execute("DELETE FROM picks")
     inserted = 0
-    today_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pulled_at = now_iso()
+
+    # Vi sparar snapshots, men tar bort dagens snapshot först så inte samma dag dubblas vid force
+    conn.execute("DELETE FROM odds_snapshot WHERE substr(pulled_at,1,10) = ?", (today_utc(),))
 
     for sport, league in LEAGUES:
         url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal"
@@ -217,54 +229,118 @@ def update(force: bool = False):
                 continue
 
             for o in outcomes:
+                selection = o.get("name", "")
                 odds = o.get("price")
-                sel = o.get("name", "")
-
                 if odds is None:
                     continue
 
-                edge, score_val = score_pick(float(odds), league)
-                dec = decision_from_score(score_val, edge)
-
                 conn.execute("""
-                    INSERT INTO picks (event_id, match, league, selection, odds, edge, score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (event_id, match, league, sel, odds, edge, score_val))
-
-                exists = conn.execute("""
-                    SELECT 1
-                    FROM history
-                    WHERE event_id = ?
-                      AND selection = ?
-                      AND substr(created_at, 1, 10) = ?
-                """, (event_id, sel, today_stamp)).fetchone()
-
-                if not exists:
-                    conn.execute("""
-                        INSERT INTO history
-                        (event_id, match, league, selection, odds, edge, score, decision, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (event_id, match, league, sel, odds, edge, score_val, dec, now_iso()))
+                    INSERT INTO odds_snapshot
+                    (event_id, match, league, selection, odds, pulled_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (event_id, match, league, selection, float(odds), pulled_at))
 
                 inserted += 1
 
     conn.commit()
 
     if inserted > 0:
-        mark_updated_today("odds")
+        mark_updated_today("odds_fetch")
 
-    return {"status": "updated", "rows": inserted, "force": force}
+    return {"status": "fetched", "rows_inserted": inserted, "force": force}
 
 # -----------------------------
-# UPDATE RESULTS
+# 2) GENERATE PICKS
 # -----------------------------
-@app.get("/update-results")
-def update_results(force: bool = False):
+@app.get("/generate-picks")
+def generate_picks():
+    conn.execute("DELETE FROM picks")
+
+    # Senaste snapshot per event_id + selection
+    df = pd.read_sql("""
+        SELECT s1.event_id, s1.match, s1.league, s1.selection, s1.odds, s1.pulled_at
+        FROM odds_snapshot s1
+        JOIN (
+            SELECT event_id, selection, MAX(pulled_at) AS max_pulled_at
+            FROM odds_snapshot
+            GROUP BY event_id, selection
+        ) s2
+        ON s1.event_id = s2.event_id
+        AND s1.selection = s2.selection
+        AND s1.pulled_at = s2.max_pulled_at
+    """, conn)
+
+    if df.empty:
+        return {"status": "no_data", "reason": "No odds snapshots found. Run /fetch-odds first."}
+
+    inserted = 0
+    generated_at = now_iso()
+    today_stamp = today_utc()
+
+    for _, row in df.iterrows():
+        edge, score = score_pick(float(row["odds"]), str(row["league"]))
+        decision = decision_from_score(score, edge)
+
+        if decision == "❌ PASS":
+            continue
+
+        conn.execute("""
+            INSERT INTO picks
+            (event_id, match, league, selection, odds, edge, score, decision, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row["event_id"],
+            row["match"],
+            row["league"],
+            row["selection"],
+            float(row["odds"]),
+            edge,
+            score,
+            decision,
+            generated_at
+        ))
+
+        exists = conn.execute("""
+            SELECT 1
+            FROM history
+            WHERE event_id = ?
+              AND selection = ?
+              AND substr(generated_at,1,10) = ?
+        """, (row["event_id"], row["selection"], today_stamp)).fetchone()
+
+        if not exists:
+            conn.execute("""
+                INSERT INTO history
+                (event_id, match, league, selection, odds, edge, score, decision, generated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row["event_id"],
+                row["match"],
+                row["league"],
+                row["selection"],
+                float(row["odds"]),
+                edge,
+                score,
+                decision,
+                generated_at
+            ))
+
+        inserted += 1
+
+    conn.commit()
+
+    return {"status": "generated", "rows_inserted": inserted}
+
+# -----------------------------
+# 3) FETCH RESULTS
+# -----------------------------
+@app.get("/fetch-results")
+def fetch_results(force: bool = False):
     if not API_FOOTBALL_KEY:
         raise HTTPException(status_code=500, detail="Missing API_FOOTBALL_KEY")
 
-    if not force and was_updated_today("results"):
-        return {"status": "skipped", "reason": "results already updated today"}
+    if not force and was_updated_today("results_fetch"):
+        return {"status": "skipped", "reason": "results already fetched today"}
 
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
     today = date.today()
@@ -296,7 +372,7 @@ def update_results(force: bool = False):
                     SELECT event_id, match
                     FROM history
                     WHERE league = ?
-                    ORDER BY created_at DESC
+                    ORDER BY generated_at DESC
                 """, (cfg["league"],)).fetchall()
 
                 matched_event_id = None
@@ -338,53 +414,32 @@ def update_results(force: bool = False):
     conn.commit()
 
     if inserted > 0:
-        mark_updated_today("results")
+        mark_updated_today("results_fetch")
 
     return {
-        "status": "updated-results",
+        "status": "fetched-results",
         "rows_inserted": inserted,
-        "leagues_checked": len(RESULT_LEAGUES),
         "forced": force,
         "debug_sample": debug_rows[:10]
     }
 
 # -----------------------------
-# PICKS
+# OUTPUTS
 # -----------------------------
 @app.get("/picks")
 def picks():
     df = pd.read_sql("""
-        SELECT event_id, match, league, selection, odds, edge, score
+        SELECT event_id, match, league, selection, odds, edge, score, decision, generated_at
         FROM picks
         ORDER BY score DESC, edge DESC
-        LIMIT 10
+        LIMIT 20
     """, conn)
 
     if df.empty:
         return []
 
-    df["decision"] = df.apply(lambda r: decision_from_score(r["score"], r["edge"]), axis=1)
-    df = df[df["decision"] != "❌ PASS"].copy()
+    return df.to_dict(orient="records")
 
-    if df.empty:
-        return []
-
-    df["bet"] = df["selection"] + " att vinna"
-    df["edge_pct"] = (df["edge"] * 100).round(1)
-
-    return df[[
-        "match",
-        "league",
-        "bet",
-        "odds",
-        "edge_pct",
-        "score",
-        "decision"
-    ]].to_dict(orient="records")
-
-# -----------------------------
-# HISTORY
-# -----------------------------
 @app.get("/history")
 def history():
     df = pd.read_sql("""
@@ -397,28 +452,24 @@ def history():
             h.edge,
             h.score,
             h.decision,
-            h.created_at,
+            h.generated_at,
             r.home_score,
             r.away_score,
             r.winner,
             r.status
         FROM history h
         LEFT JOIN results r ON h.event_id = r.event_id
-        ORDER BY h.created_at DESC
+        ORDER BY h.generated_at DESC
         LIMIT 300
     """, conn)
     return df.to_dict(orient="records")
 
-# -----------------------------
-# STATS
-# -----------------------------
 @app.get("/stats")
 def stats():
     df = pd.read_sql("""
         SELECT
             h.event_id,
             h.match,
-            h.league,
             h.selection,
             h.odds,
             r.winner
@@ -432,12 +483,10 @@ def stats():
     def calc_win(row):
         if pd.isna(row["winner"]):
             return None
-
         try:
             home, away = row["match"].split(" vs ")
         except ValueError:
             return None
-
         if row["selection"] == home and row["winner"] == "HOME":
             return 1
         if row["selection"] == away and row["winner"] == "AWAY":
