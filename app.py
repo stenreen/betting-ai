@@ -192,13 +192,22 @@ def generate_picks():
 
 @app.get("/picks")
 def picks():
-    return safe_data(
-        supabase.table("picks")
-        .select("*")
-        .order("score", desc=True)
-        .limit(20)
-        .execute()
-    )
+    try:
+        data = safe_data(
+            supabase.table("picks")
+            .select("*")
+            .limit(20)
+            .execute()
+        )
+
+        def sort_key(row):
+            return row.get("score", 0)
+
+        data = sorted(data, key=sort_key, reverse=True)
+        return data
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/best-odds")
 def best_odds():
@@ -212,13 +221,22 @@ def best_odds():
 
 @app.get("/history")
 def history():
-    return safe_data(
-        supabase.table("picks")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(200)
-        .execute()
-    )
+    try:
+        data = safe_data(
+            supabase.table("picks")
+            .select("*")
+            .limit(200)
+            .execute()
+        )
+
+        def sort_key(row):
+            return row.get("generated_at") or row.get("created_at") or ""
+
+        data = sorted(data, key=sort_key, reverse=True)
+        return data
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stats")
 def stats():
