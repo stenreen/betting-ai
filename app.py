@@ -81,29 +81,13 @@ def root():
 
 @app.get("/health")
 def health():
-    try:
-        result = {"status": "ok"}
-
-        try:
-            result["odds_market_rows"] = len(safe_data(supabase.table("odds_market").select("id").execute()))
-        except Exception as e:
-            result["odds_market_rows"] = f"error: {str(e)}"
-
-        try:
-            result["best_odds_rows"] = len(safe_data(supabase.table("best_odds").select("id").execute()))
-        except Exception as e:
-            result["best_odds_rows"] = f"error: {str(e)}"
-
-        try:
-            result["pick_rows"] = len(safe_data(supabase.table("picks").select("id").execute()))
-        except Exception as e:
-            result["pick_rows"] = f"error: {str(e)}"
-
-        return result
-
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
+    return {
+        "status": "ok",
+        "odds_rows": len(safe_data(supabase.table("odds_snapshot").select("*").execute())),
+        "pick_rows": len(safe_data(supabase.table("picks").select("*").execute())),
+        "history_rows": len(safe_data(supabase.table("picks").select("*").execute())),
+        "result_rows": 0
+    }
 @app.post("/ingest-odds")
 def ingest_odds(data: list[dict] = Body(...)):
     rows = []
@@ -225,3 +209,25 @@ def best_odds():
         .limit(200)
         .execute()
     )
+
+@app.get("/history")
+def history():
+    return safe_data(
+        supabase.table("picks")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(200)
+        .execute()
+    )
+
+@app.get("/stats")
+def stats():
+    picks = safe_data(supabase.table("picks").select("*").execute())
+
+    return {
+        "plays": len(picks),
+        "wins": 0,
+        "losses": 0,
+        "profit_units": 0.0,
+        "roi_percent": 0.0
+    }
