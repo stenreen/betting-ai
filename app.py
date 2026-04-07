@@ -81,12 +81,28 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "odds_market_rows": len(safe_data(supabase.table("odds_market").select("id").execute())),
-        "best_odds_rows": len(safe_data(supabase.table("best_odds").select("id").execute())),
-        "pick_rows": len(safe_data(supabase.table("picks").select("id").execute())),
-    }
+    try:
+        result = {"status": "ok"}
+
+        try:
+            result["odds_market_rows"] = len(safe_data(supabase.table("odds_market").select("id").execute()))
+        except Exception as e:
+            result["odds_market_rows"] = f"error: {str(e)}"
+
+        try:
+            result["best_odds_rows"] = len(safe_data(supabase.table("best_odds").select("id").execute()))
+        except Exception as e:
+            result["best_odds_rows"] = f"error: {str(e)}"
+
+        try:
+            result["pick_rows"] = len(safe_data(supabase.table("picks").select("id").execute()))
+        except Exception as e:
+            result["pick_rows"] = f"error: {str(e)}"
+
+        return result
+
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 @app.post("/ingest-odds")
 def ingest_odds(data: list[dict] = Body(...)):
