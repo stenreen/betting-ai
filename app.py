@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from supabase import create_client
 import requests
 import os
@@ -52,10 +52,9 @@ def fetch_betfair():
         "Content-Type": "application/json"
     }
 
-    # 1) hämta marknader (fotboll, MATCH_ODDS)
     catalogue_payload = {
         "filter": {
-            "eventTypeIds": ["1"],   # Soccer
+            "eventTypeIds": ["1"],
             "marketTypeCodes": ["MATCH_ODDS"]
         },
         "maxResults": "100",
@@ -85,7 +84,6 @@ def fetch_betfair():
 
     market_ids = [m["marketId"] for m in markets[:50]]
 
-    # 2) hämta priser
     book_payload = {
         "marketIds": market_ids,
         "priceProjection": {
@@ -188,11 +186,9 @@ def build_value_candidates():
     if not bookmaker_rows:
         return {"status": "no bookmaker data", "rows": 0}
 
-    # index Betfair per event+selection
     bf_map = {}
     for row in betfair_rows:
         key = (make_event_key(row["event_name"], row["league"]), row["selection"].strip().lower())
-        # behåll bästa (lägsta implied / högsta price om flera)
         if key not in bf_map or float(row["back_price"]) > float(bf_map[key]["back_price"]):
             bf_map[key] = row
 
@@ -244,8 +240,3 @@ def value_picks():
         .limit(20)
         .execute()
     )
-    def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def make_event_key(event_name: str, league: str) -> str:
-    return f"{league.strip().lower()}|{event_name.strip().lower()}"
