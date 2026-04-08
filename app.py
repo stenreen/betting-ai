@@ -1,13 +1,15 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from supabase import create_client
+import requests
 import os
-import unicodedata
 from datetime import datetime, timezone
 
-app = FastAPI(title="Betting AI Aggregator V1")
+app = FastAPI(title="Betfair V1")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+BETFAIR_APP_KEY = os.getenv("BETFAIR_APP_KEY", "")
+BETFAIR_SESSION_TOKEN = os.getenv("BETFAIR_SESSION_TOKEN", "")
 
 if not SUPABASE_URL:
     raise RuntimeError("Missing SUPABASE_URL")
@@ -22,230 +24,196 @@ def now_iso() -> str:
 def safe_data(resp):
     return resp.data or []
 
-def normalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
-    s = (
-        s.replace(" if", "")
-         .replace(" fc", "")
-         .replace(" bk", "")
-         .replace(" ff", "")
-         .replace(".", "")
-         .replace("-", " ")
-         .replace("  ", " ")
-         .strip()
-    )
-    return s
+def make_event_key(event_name: str, league: str) -> str:
+    return f"{league.strip().lower()}|{event_name.strip().lower()}"
 
-def make_event_key(league: str, match: str) -> str:
-    league_n = normalize_text(league)
-    match_n = normalize_text(match)
-    return f"{league_n}|{match_n}"
-
-def score_pick(odds: float, league: str):
-    implied = 1.0 / odds
-
-    league_bonus = {
-        "Allsvenskan": 0.020,
-        "Superettan": 0.015,
-        "Superliga": 0.015,
-        "Eliteserien": 0.020,
-        "Championship": 0.015,
-        "La Liga": 0.005,
-        "Serie A": 0.005,
-        "Ligue 1": 0.005,
-        "MLS": 0.020,
-    }.get(league, 0.0)
-
-    odds_bonus = 0.0
-    if 1.70 <= odds <= 2.50:
-        odds_bonus = 0.010
-    elif 2.50 < odds <= 3.50:
-        odds_bonus = 0.005
-
-    model_prob = min(max(implied + league_bonus + odds_bonus, 0.01), 0.99)
-    edge = model_prob - implied
-    score = edge * 100.0
-
-    return round(edge, 4), round(score, 2)
-
-def decision_from_score(score: float) -> str:
-    if score >= 2.5:
-        return "🔥 SPELA"
-    if score >= 1.5:
-        return "⚠️ BEVAKA"
-    return "❌ PASS"
-
-@app.get("/")
-def root():
-    return {"status": "running", "version": "aggregator-v1"}
+def score_edge(edge: float) -> float:
+    return round(edge * 100, 2)
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "odds_rows": len(safe_data(supabase.table("odds_snapshot").select("*").execute())),
-        "pick_rows": len(safe_data(supabase.table("picks").select("*").execute())),
-        "history_rows": len(safe_data(supabase.table("picks").select("*").execute())),
-        "result_rows": 0
+        "betfair_rows": len(safe_data(supabase.table("betfair_market").select("id").execute())),
+        "bookmaker_rows": len(safe_data(supabase.table("bookmaker_market").select("id").execute())),
+        "value_rows": len(safe_data(supabase.table("value_candidates").select("id").execute())),
     }
-@app.post("/ingest-odds")
-def ingest_odds(data: list[dict] = Body(...)):
+
+@app.get("/fetch-betfair")
+def fetch_betfair():
+    if not BETFAIR_APP_KEY:
+        raise HTTPException(status_code=500, detail="Missing BETFAIR_APP_KEY")
+    if not BETFAIR_SESSION_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing BETFAIR_SESSION_TOKEN")
+
+    headers = {
+        "X-Application": BETFAIR_APP_KEY,
+        "X-Authentication": BETFAIR_SESSION_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    # 1) hämta marknader (fotboll, MATCH_ODDS)
+    catalogue_payload = {
+        "filter": {
+            "eventTypeIds": ["1"],   # Soccer
+            "marketTypeCodes": ["MATCH_ODDS"]
+        },
+        "maxResults": "100",
+        "marketProjection": ["EVENT", "COMPETITION", "RUNNER_DESCRIPTION"]
+    }
+
+    cat_resp = requests.post(
+        "https://api.betfair.com/exchange/betting/json-rpc/v1",
+        headers=headers,
+        json=[{
+            "jsonrpc": "2.0",
+            "method": "SportsAPING/v1.0/listMarketCatalogue",
+            "params": catalogue_payload,
+            "id": 1
+        }],
+        timeout=30
+    )
+
+    if cat_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Betfair catalogue failed: {cat_resp.text}")
+
+    cat_json = cat_resp.json()
+    markets = cat_json[0].get("result", [])
+
+    if not markets:
+        return {"status": "no markets", "rows": 0}
+
+    market_ids = [m["marketId"] for m in markets[:50]]
+
+    # 2) hämta priser
+    book_payload = {
+        "marketIds": market_ids,
+        "priceProjection": {
+            "priceData": ["EX_BEST_OFFERS"]
+        }
+    }
+
+    book_resp = requests.post(
+        "https://api.betfair.com/exchange/betting/json-rpc/v1",
+        headers=headers,
+        json=[{
+            "jsonrpc": "2.0",
+            "method": "SportsAPING/v1.0/listMarketBook",
+            "params": book_payload,
+            "id": 1
+        }],
+        timeout=30
+    )
+
+    if book_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Betfair book failed: {book_resp.text}")
+
+    book_json = book_resp.json()
+    books = book_json[0].get("result", [])
+
+    market_lookup = {m["marketId"]: m for m in markets}
     rows = []
 
-    for row in data:
-        required = ["match", "league", "selection", "odds", "bookmaker"]
-        for field in required:
-            if field not in row:
-                raise HTTPException(status_code=400, detail=f"Missing {field}")
-
-        event_key = row.get("event_key") or make_event_key(row["league"], row["match"])
-
-        rows.append({
-            "event_key": event_key,
-            "event_id": row.get("event_id", ""),
-            "match": row["match"],
-            "league": row["league"],
-            "selection": row["selection"],
-            "odds": float(row["odds"]),
-            "bookmaker": row["bookmaker"],
-            "source_url": row.get("source_url", ""),
-            "scraped_at": now_iso()
-        })
-
-    if rows:
-        supabase.table("odds_market").insert(rows).execute()
-
-    return {"status": "ingested", "rows": len(rows)}
-
-@app.get("/build-best-odds")
-def build_best_odds():
-    market_rows = safe_data(supabase.table("odds_market").select("*").execute())
-
-    if not market_rows:
-        return {"status": "no market data", "rows": 0}
-
-    grouped = {}
-
-    for row in market_rows:
-        key = (row["event_key"], row["selection"])
-        if key not in grouped:
-            grouped[key] = row
-        else:
-            if float(row["odds"]) > float(grouped[key]["odds"]):
-                grouped[key] = row
-
-    best_rows = []
-    for (_, _), row in grouped.items():
-        best_rows.append({
-            "event_key": row["event_key"],
-            "match": row["match"],
-            "league": row["league"],
-            "selection": row["selection"],
-            "best_odds": float(row["odds"]),
-            "best_bookmaker": row["bookmaker"],
-            "updated_at": now_iso()
-        })
-
-    supabase.table("best_odds").delete().neq("event_key", "").execute()
-
-    if best_rows:
-        supabase.table("best_odds").insert(best_rows).execute()
-
-    return {"status": "built", "rows": len(best_rows)}
-
-@app.get("/generate-picks")
-def generate_picks():
-    rows = safe_data(supabase.table("best_odds").select("*").execute())
-
-    if not rows:
-        return {"status": "no best odds", "rows": 0}
-
-    picks = []
-    for row in rows:
-        edge, score = score_pick(float(row["best_odds"]), row["league"])
-        decision = decision_from_score(score)
-
-        if decision == "❌ PASS":
+    for book in books:
+        market_id = book["marketId"]
+        meta = market_lookup.get(market_id)
+        if not meta:
             continue
 
-        picks.append({
-            "event_key": row["event_key"],
-            "match": row["match"],
-            "league": row["league"],
-            "selection": row["selection"],
-            "odds": float(row["best_odds"]),
-            "bookmaker": row["best_bookmaker"],
-            "edge": edge,
-            "score": score,
-            "decision": decision,
+        event_name = meta.get("event", {}).get("name", "")
+        league = meta.get("competition", {}).get("name", "Unknown")
+
+        runner_names = {}
+        for r in meta.get("runners", []):
+            runner_names[r["selectionId"]] = r["runnerName"]
+
+        for runner in book.get("runners", []):
+            ex = runner.get("ex", {})
+            offers = ex.get("availableToBack", [])
+            if not offers:
+                continue
+
+            back_price = float(offers[0]["price"])
+            implied_prob = round(1.0 / back_price, 4)
+
+            rows.append({
+                "market_id": market_id,
+                "event_name": event_name,
+                "league": league,
+                "selection": runner_names.get(runner["selectionId"], str(runner["selectionId"])),
+                "back_price": back_price,
+                "implied_prob": implied_prob,
+                "fetched_at": now_iso()
+            })
+
+    if rows:
+        supabase.table("betfair_market").insert(rows).execute()
+
+    return {"status": "betfair fetched", "rows": len(rows)}
+
+@app.get("/build-value-candidates")
+def build_value_candidates():
+    betfair_rows = safe_data(supabase.table("betfair_market").select("*").execute())
+    bookmaker_rows = safe_data(supabase.table("bookmaker_market").select("*").execute())
+
+    if not betfair_rows:
+        return {"status": "no betfair data", "rows": 0}
+    if not bookmaker_rows:
+        return {"status": "no bookmaker data", "rows": 0}
+
+    # index Betfair per event+selection
+    bf_map = {}
+    for row in betfair_rows:
+        key = (make_event_key(row["event_name"], row["league"]), row["selection"].strip().lower())
+        # behåll bästa (lägsta implied / högsta price om flera)
+        if key not in bf_map or float(row["back_price"]) > float(bf_map[key]["back_price"]):
+            bf_map[key] = row
+
+    candidates = []
+
+    for bm in bookmaker_rows:
+        key = (bm["event_key"], bm["selection"].strip().lower())
+        bf = bf_map.get(key)
+        if not bf:
+            continue
+
+        bookmaker_odds = float(bm["odds"])
+        betfair_odds = float(bf["back_price"])
+
+        implied_betfair = 1.0 / betfair_odds
+        implied_bookmaker = 1.0 / bookmaker_odds
+        edge = implied_betfair - implied_bookmaker
+
+        if edge <= 0:
+            continue
+
+        candidates.append({
+            "event_key": bm["event_key"],
+            "event_name": bm["event_name"],
+            "league": bm["league"],
+            "selection": bm["selection"],
+            "bookmaker": bm["bookmaker"],
+            "bookmaker_odds": bookmaker_odds,
+            "betfair_odds": betfair_odds,
+            "edge": round(edge, 4),
+            "score": score_edge(edge),
             "created_at": now_iso()
         })
 
-    picks = sorted(picks, key=lambda x: x["score"], reverse=True)[:20]
+    supabase.table("value_candidates").delete().neq("event_key", "").execute()
 
-    supabase.table("picks").delete().neq("event_key", "").execute()
+    if candidates:
+        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+        supabase.table("value_candidates").insert(candidates).execute()
 
-    if picks:
-        supabase.table("picks").insert(picks).execute()
+    return {"status": "built", "rows": len(candidates)}
 
-    return {"status": "generated", "rows": len(picks)}
-
-@app.get("/picks")
-def picks():
-    try:
-        data = safe_data(
-            supabase.table("picks")
-            .select("*")
-            .limit(20)
-            .execute()
-        )
-
-        def sort_key(row):
-            return row.get("score", 0)
-
-        data = sorted(data, key=sort_key, reverse=True)
-        return data
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/best-odds")
-def best_odds():
+@app.get("/value-picks")
+def value_picks():
     return safe_data(
-        supabase.table("best_odds")
+        supabase.table("value_candidates")
         .select("*")
-        .order("updated_at", desc=True)
-        .limit(200)
+        .order("score", desc=True)
+        .limit(20)
         .execute()
     )
-
-@app.get("/history")
-def history():
-    try:
-        data = safe_data(
-            supabase.table("picks")
-            .select("*")
-            .limit(200)
-            .execute()
-        )
-
-        def sort_key(row):
-            return row.get("generated_at") or row.get("created_at") or ""
-
-        data = sorted(data, key=sort_key, reverse=True)
-        return data
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/stats")
-def stats():
-    picks = safe_data(supabase.table("picks").select("*").execute())
-
-    return {
-        "plays": len(picks),
-        "wins": 0,
-        "losses": 0,
-        "profit_units": 0.0,
-        "roi_percent": 0.0
-    }
