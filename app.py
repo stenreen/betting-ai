@@ -151,6 +151,33 @@ def fetch_betfair():
 
     return {"status": "betfair fetched", "rows": len(rows)}
 
+@app.post("/ingest-bookmaker-odds")
+def ingest_bookmaker_odds(data: list[dict] = Body(...)):
+    rows = []
+
+    for row in data:
+        required = ["event_name", "league", "selection", "bookmaker", "odds"]
+        for field in required:
+            if field not in row:
+                raise HTTPException(status_code=400, detail=f"Missing {field}")
+
+        event_key = row.get("event_key") or make_event_key(row["event_name"], row["league"])
+
+        rows.append({
+            "event_key": event_key,
+            "event_name": row["event_name"],
+            "league": row["league"],
+            "selection": row["selection"],
+            "bookmaker": row["bookmaker"],
+            "odds": float(row["odds"]),
+            "fetched_at": now_iso()
+        })
+
+    if rows:
+        supabase.table("bookmaker_market").insert(rows).execute()
+
+    return {"status": "bookmaker odds ingested", "rows": len(rows)}
+
 @app.get("/build-value-candidates")
 def build_value_candidates():
     betfair_rows = safe_data(supabase.table("betfair_market").select("*").execute())
@@ -217,3 +244,8 @@ def value_picks():
         .limit(20)
         .execute()
     )
+    def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def make_event_key(event_name: str, league: str) -> str:
+    return f"{league.strip().lower()}|{event_name.strip().lower()}"
